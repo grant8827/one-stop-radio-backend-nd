@@ -1,0 +1,28 @@
+{
+  "name": "onestopradio-mock-api",
+  "version": "1.0.0",
+  "description": "Mock API server for OneStopRadio AudioStreamEncoder testing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "install-deps": "npm install express cors",
+    "setup": "npm install express cors && npm start"
+  },
+  "keywords": [
+    "onestopradio",
+    "streaming",
+    "audio",
+    "mock",
+    "api"
+  ],
+  "author": "OneStopRadio Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0"
+  }
+}
