@@ -47,6 +47,48 @@ let streamState = {
     }
 };
 
+// Audio system state for microphone and talkover
+let audioSystemState = {
+    microphone: {
+        enabled: false,
+        gain: 70.0,
+        device_id: null,
+        device_name: 'Default Microphone',
+        sample_rate: 48000,
+        channels: 1,
+        latency: 0.0,
+        peak_level: 0.0
+    },
+    talkover: {
+        enabled: false,
+        active: false,
+        duck_level: 25.0,
+        fade_time: 0.1,
+        auto_enable: true,
+        original_volume: null
+    },
+    master: {
+        volume: 75.0,
+        peak_left: 0.0,
+        peak_right: 0.0
+    },
+    channels: {
+        a: {
+            playing: false,
+            volume: 75.0,
+            peak_left: 0.0,
+            peak_right: 0.0
+        },
+        b: {
+            playing: false,
+            volume: 75.0,
+            peak_left: 0.0,
+            peak_right: 0.0
+        }
+    },
+    backend_type: 'web_audio' // 'cpp_media_server' or 'web_audio'
+};
+
 // Simulate streaming statistics updates
 function updateStreamStats() {
     if (streamState.status === 'streaming') {
@@ -69,8 +111,63 @@ function updateStreamStats() {
     }
 }
 
-// Start stats update interval
+// Simulate audio system statistics updates
+function updateAudioStats() {
+    // Simulate microphone levels if enabled
+    if (audioSystemState.microphone.enabled) {
+        audioSystemState.microphone.peak_level = Math.random() * 0.8 + 0.1; // 0.1-0.9
+    } else {
+        audioSystemState.microphone.peak_level = 0.0;
+    }
+    
+    // Simulate channel levels if playing
+    if (audioSystemState.channels.a.playing) {
+        audioSystemState.channels.a.peak_left = Math.random() * 0.7 + 0.2; // 0.2-0.9
+        audioSystemState.channels.a.peak_right = Math.random() * 0.7 + 0.2;
+    } else {
+        audioSystemState.channels.a.peak_left = 0.0;
+        audioSystemState.channels.a.peak_right = 0.0;
+    }
+    
+    if (audioSystemState.channels.b.playing) {
+        audioSystemState.channels.b.peak_left = Math.random() * 0.7 + 0.2; // 0.2-0.9
+        audioSystemState.channels.b.peak_right = Math.random() * 0.7 + 0.2;
+    } else {
+        audioSystemState.channels.b.peak_left = 0.0;
+        audioSystemState.channels.b.peak_right = 0.0;
+    }
+    
+    // Calculate master levels based on active channels and microphone
+    let masterLeft = Math.max(
+        audioSystemState.channels.a.peak_left * (audioSystemState.channels.a.volume / 100),
+        audioSystemState.channels.b.peak_left * (audioSystemState.channels.b.volume / 100)
+    );
+    let masterRight = Math.max(
+        audioSystemState.channels.a.peak_right * (audioSystemState.channels.a.volume / 100),
+        audioSystemState.channels.b.peak_right * (audioSystemState.channels.b.volume / 100)
+    );
+    
+    // Add microphone to master if enabled
+    if (audioSystemState.microphone.enabled) {
+        const micLevel = audioSystemState.microphone.peak_level * (audioSystemState.microphone.gain / 100);
+        masterLeft = Math.max(masterLeft, micLevel);
+        masterRight = Math.max(masterRight, micLevel);
+    }
+    
+    // Apply talkover ducking if active
+    if (audioSystemState.talkover.active) {
+        const duckFactor = audioSystemState.talkover.duck_level / 100;
+        masterLeft *= duckFactor;
+        masterRight *= duckFactor;
+    }
+    
+    audioSystemState.master.peak_left = masterLeft;
+    audioSystemState.master.peak_right = masterRight;
+}
+
+// Start stats update intervals
 setInterval(updateStreamStats, 2000);
+setInterval(updateAudioStats, 100); // More frequent for audio levels
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -197,6 +294,272 @@ app.post('/api/audio/stream/metadata', (req, res) => {
         action: 'metadata_update',
         artist: streamState.currentTrack.artist,
         title: streamState.currentTrack.title
+    });
+});
+
+// Audio System Endpoints
+// ======================
+
+// Get complete audio system status
+app.get('/api/audio/system/status', (req, res) => {
+    console.log('🎛️ Audio system status requested');
+    
+    res.json({
+        success: true,
+        audio_system: {
+            microphone: audioSystemState.microphone,
+            talkover: audioSystemState.talkover,
+            master: audioSystemState.master,
+            channels: audioSystemState.channels,
+            backend_type: audioSystemState.backend_type,
+            timestamp: new Date().toISOString()
+        }
+    });
+});
+
+// Microphone control endpoints
+app.post('/api/audio/microphone/start', (req, res) => {
+    const { gain = 70.0, device_id = null } = req.body;
+    
+    audioSystemState.microphone.enabled = true;
+    audioSystemState.microphone.gain = Math.max(0, Math.min(100, gain));
+    audioSystemState.microphone.device_id = device_id;
+    
+    // Auto-enable talkover if configured
+    if (audioSystemState.talkover.auto_enable) {
+        audioSystemState.talkover.enabled = true;
+        audioSystemState.talkover.active = true;
+        audioSystemState.talkover.original_volume = audioSystemState.master.volume;
+        
+        console.log('🎤 Microphone started - Auto-enabling talkover');
+    }
+    
+    console.log(`🎤 Microphone started: Gain ${audioSystemState.microphone.gain}%`);
+    
+    res.json({
+        success: true,
+        action: 'microphone_start',
+        microphone: audioSystemState.microphone,
+        talkover_auto_enabled: audioSystemState.talkover.auto_enable
+    });
+});
+
+app.post('/api/audio/microphone/stop', (req, res) => {
+    audioSystemState.microphone.enabled = false;
+    audioSystemState.microphone.peak_level = 0.0;
+    
+    // Disable talkover when microphone stops
+    if (audioSystemState.talkover.enabled) {
+        audioSystemState.talkover.enabled = false;
+        audioSystemState.talkover.active = false;
+        
+        // Restore original volume if saved
+        if (audioSystemState.talkover.original_volume !== null) {
+            audioSystemState.master.volume = audioSystemState.talkover.original_volume;
+            audioSystemState.talkover.original_volume = null;
+        }
+        
+        console.log('🎤 Microphone stopped - Disabling talkover and restoring volume');
+    }
+    
+    console.log('🎤 Microphone stopped');
+    
+    res.json({
+        success: true,
+        action: 'microphone_stop',
+        microphone: audioSystemState.microphone,
+        talkover_disabled: true
+    });
+});
+
+app.post('/api/audio/microphone/gain', (req, res) => {
+    const { gain } = req.body;
+    
+    if (typeof gain !== 'number' || gain < 0 || gain > 100) {
+        return res.status(400).json({
+            success: false,
+            error: 'Gain must be a number between 0 and 100'
+        });
+    }
+    
+    audioSystemState.microphone.gain = gain;
+    
+    console.log(`🎤 Microphone gain set to ${gain}%`);
+    
+    res.json({
+        success: true,
+        action: 'microphone_gain_set',
+        gain: audioSystemState.microphone.gain
+    });
+});
+
+// Talkover control endpoints
+app.post('/api/audio/talkover/enable', (req, res) => {
+    const { duck_level = 25.0, fade_time = 0.1 } = req.body;
+    
+    if (!audioSystemState.microphone.enabled) {
+        return res.status(400).json({
+            success: false,
+            error: 'Cannot enable talkover - microphone is not enabled',
+            action: 'talkover_enable_failed'
+        });
+    }
+    
+    // Store original volume before ducking
+    if (audioSystemState.talkover.original_volume === null) {
+        audioSystemState.talkover.original_volume = audioSystemState.master.volume;
+    }
+    
+    audioSystemState.talkover.enabled = true;
+    audioSystemState.talkover.active = true;
+    audioSystemState.talkover.duck_level = Math.max(0, Math.min(100, duck_level));
+    audioSystemState.talkover.fade_time = Math.max(0.0, fade_time);
+    
+    console.log(`🎤 Talkover enabled - Ducking to ${audioSystemState.talkover.duck_level}%`);
+    
+    res.json({
+        success: true,
+        action: 'talkover_enabled',
+        talkover: audioSystemState.talkover
+    });
+});
+
+app.post('/api/audio/talkover/disable', (req, res) => {
+    audioSystemState.talkover.enabled = false;
+    audioSystemState.talkover.active = false;
+    
+    // Restore original volume if saved
+    if (audioSystemState.talkover.original_volume !== null) {
+        audioSystemState.master.volume = audioSystemState.talkover.original_volume;
+        audioSystemState.talkover.original_volume = null;
+        console.log(`🎤 Talkover disabled - Volume restored to ${audioSystemState.master.volume}%`);
+    } else {
+        console.log('🎤 Talkover disabled');
+    }
+    
+    res.json({
+        success: true,
+        action: 'talkover_disabled',
+        talkover: audioSystemState.talkover,
+        master_volume: audioSystemState.master.volume
+    });
+});
+
+// Channel control endpoints (for mixer integration)
+app.post('/api/audio/channel/:channel/play', (req, res) => {
+    const { channel } = req.params;
+    
+    if (!['a', 'b'].includes(channel)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Channel must be "a" or "b"'
+        });
+    }
+    
+    audioSystemState.channels[channel].playing = true;
+    
+    console.log(`▶️ Channel ${channel.toUpperCase()} started playing`);
+    
+    res.json({
+        success: true,
+        action: `channel_${channel}_play`,
+        channel: audioSystemState.channels[channel]
+    });
+});
+
+app.post('/api/audio/channel/:channel/stop', (req, res) => {
+    const { channel } = req.params;
+    
+    if (!['a', 'b'].includes(channel)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Channel must be "a" or "b"'
+        });
+    }
+    
+    audioSystemState.channels[channel].playing = false;
+    audioSystemState.channels[channel].peak_left = 0.0;
+    audioSystemState.channels[channel].peak_right = 0.0;
+    
+    console.log(`⏹️ Channel ${channel.toUpperCase()} stopped`);
+    
+    res.json({
+        success: true,
+        action: `channel_${channel}_stop`,
+        channel: audioSystemState.channels[channel]
+    });
+});
+
+app.post('/api/audio/channel/:channel/volume', (req, res) => {
+    const { channel } = req.params;
+    const { volume } = req.body;
+    
+    if (!['a', 'b'].includes(channel)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Channel must be "a" or "b"'
+        });
+    }
+    
+    if (typeof volume !== 'number' || volume < 0 || volume > 100) {
+        return res.status(400).json({
+            success: false,
+            error: 'Volume must be a number between 0 and 100'
+        });
+    }
+    
+    audioSystemState.channels[channel].volume = volume;
+    
+    console.log(`🔊 Channel ${channel.toUpperCase()} volume set to ${volume}%`);
+    
+    res.json({
+        success: true,
+        action: `channel_${channel}_volume_set`,
+        channel: audioSystemState.channels[channel]
+    });
+});
+
+// Master volume control
+app.post('/api/audio/master/volume', (req, res) => {
+    const { volume } = req.body;
+    
+    if (typeof volume !== 'number' || volume < 0 || volume > 100) {
+        return res.status(400).json({
+            success: false,
+            error: 'Volume must be a number between 0 and 100'
+        });
+    }
+    
+    audioSystemState.master.volume = volume;
+    
+    // Update original volume for talkover if not currently ducking
+    if (!audioSystemState.talkover.active) {
+        audioSystemState.talkover.original_volume = volume;
+    }
+    
+    console.log(`🔊 Master volume set to ${volume}%`);
+    
+    res.json({
+        success: true,
+        action: 'master_volume_set',
+        master: audioSystemState.master
+    });
+});
+
+// Audio levels endpoint (for real-time monitoring)
+app.get('/api/audio/levels', (req, res) => {
+    res.json({
+        success: true,
+        levels: {
+            microphone: audioSystemState.microphone.peak_level * 100, // Convert to percentage
+            master_left: audioSystemState.master.peak_left * 100,
+            master_right: audioSystemState.master.peak_right * 100,
+            channel_a_left: audioSystemState.channels.a.peak_left * 100,
+            channel_a_right: audioSystemState.channels.a.peak_right * 100,
+            channel_b_left: audioSystemState.channels.b.peak_left * 100,
+            channel_b_right: audioSystemState.channels.b.peak_right * 100,
+            timestamp: new Date().toISOString()
+        }
     });
 });
 
