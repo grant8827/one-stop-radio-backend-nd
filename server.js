@@ -23,8 +23,20 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 5001;
 
+// CORS configuration for frontend connections
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000', 
+        'http://0.0.0.0:3000',
+        'https://one-stop-radio-frontend-production.up.railway.app'
+    ],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 // Middleware
-app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
