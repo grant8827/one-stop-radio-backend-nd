@@ -19,9 +19,15 @@ try {
 
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
 const port = process.env.PORT || 5001;
+
+// Create HTTP server and WebSocket server
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 // CORS configuration for frontend connections
 app.use(cors({
@@ -58,6 +64,213 @@ let streamState = {
         title: 'Unknown Track'
     }
 };
+
+// Real-time DJ session management
+let djSessions = new Map(); // sessionId -> session data
+let djConnections = new Map(); // sessionId -> Set of WebSocket connections
+
+// DJ Session data structure
+function createDJSession(sessionId, djId, sessionName) {
+    return {
+        id: sessionId,
+        dj_id: djId,
+        session_name: sessionName,
+        started_at: new Date().toISOString(),
+        is_live: false,
+        is_recording: false,
+        
+        // Current tracks on decks
+        deck_a: {
+            track: null,
+            playing: false,
+            position: 0.0,
+            volume: 0.8,
+            eq: { low: 0.0, mid: 0.0, high: 0.0 },
+            bpm: null,
+            synced: false
+        },
+        deck_b: {
+            track: null,
+            playing: false,
+            position: 0.0,
+            volume: 0.8,
+            eq: { low: 0.0, mid: 0.0, high: 0.0 },
+            bpm: null,
+            synced: false
+        },
+        
+        // Mixer state
+        mixer: {
+            crossfader: 0.0,
+            master_volume: 0.8,
+            channel_a_volume: 0.8,
+            channel_b_volume: 0.8,
+            sync_enabled: false
+        },
+        
+        // Real-time audio levels
+        audio_levels: {
+            master_left: 0.0,
+            master_right: 0.0,
+            channel_a_left: 0.0,
+            channel_a_right: 0.0,
+            channel_b_left: 0.0,
+            channel_b_right: 0.0,
+            updated_at: new Date().toISOString()
+        },
+        
+        // Statistics
+        stats: {
+            current_listeners: 0,
+            peak_listeners: 0,
+            total_tracks_played: 0,
+            session_duration: 0
+        },
+        
+        updated_at: new Date().toISOString()
+    };
+}
+
+// WebSocket connection manager for real-time DJ features
+function broadcastToSession(sessionId, message) {
+    const connections = djConnections.get(sessionId);
+    if (connections) {
+        const messageStr = JSON.stringify(message);
+        connections.forEach(ws => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(messageStr);
+            }
+        });
+    }
+}
+
+function addConnectionToSession(sessionId, ws) {
+    if (!djConnections.has(sessionId)) {
+        djConnections.set(sessionId, new Set());
+    }
+    djConnections.get(sessionId).add(ws);
+    
+    console.log(`🎧 Client connected to DJ session ${sessionId}`);
+}
+
+function removeConnectionFromSession(sessionId, ws) {
+    const connections = djConnections.get(sessionId);
+    if (connections) {
+        connections.delete(ws);
+        if (connections.size === 0) {
+            djConnections.delete(sessionId);
+        }
+    }
+    
+    console.log(`🎧 Client disconnected from DJ session ${sessionId}`);
+}
+
+// WebSocket server for real-time DJ communication
+wss.on('connection', (ws, req) => {
+    console.log('🔗 New WebSocket connection established');
+    
+    let sessionId = null;
+    
+    ws.on('message', (data) => {
+        try {
+            const message = JSON.parse(data);
+            
+            switch (message.type) {
+                case 'join_session':
+                    sessionId = message.session_id;
+                    addConnectionToSession(sessionId, ws);
+                    
+                    // Send current session state
+                    const session = djSessions.get(sessionId);
+                    if (session) {
+                        ws.send(JSON.stringify({
+                            type: 'session_state',
+                            data: session
+                        }));
+                    }
+                    break;
+                    
+                case 'audio_levels':
+                    if (sessionId) {
+                        const session = djSessions.get(sessionId);
+                        if (session) {
+                            session.audio_levels = {
+                                ...message.data,
+                                updated_at: new Date().toISOString()
+                            };
+                            
+                            // Broadcast audio levels to all connected clients
+                            broadcastToSession(sessionId, {
+                                type: 'audio_levels',
+                                data: session.audio_levels
+                            });
+                        }
+                    }
+                    break;
+                    
+                case 'mixer_update':
+                    if (sessionId) {
+                        const session = djSessions.get(sessionId);
+                        if (session) {
+                            session.mixer = { ...session.mixer, ...message.data };
+                            session.updated_at = new Date().toISOString();
+                            
+                            // Broadcast mixer update
+                            broadcastToSession(sessionId, {
+                                type: 'mixer_updated',
+                                data: session.mixer
+                            });
+                        }
+                    }
+                    break;
+                    
+                case 'deck_update':
+                    if (sessionId) {
+                        const session = djSessions.get(sessionId);
+                        if (session && message.deck) {
+                            const deck = message.deck === 'A' ? 'deck_a' : 'deck_b';
+                            session[deck] = { ...session[deck], ...message.data };
+                            session.updated_at = new Date().toISOString();
+                            
+                            // Broadcast deck update
+                            broadcastToSession(sessionId, {
+                                type: 'deck_updated',
+                                deck: message.deck,
+                                data: session[deck]
+                            });
+                        }
+                    }
+                    break;
+                    
+                case 'heartbeat':
+                    ws.send(JSON.stringify({ type: 'heartbeat_ack' }));
+                    break;
+                    
+                default:
+                    console.log(`🔍 Unknown WebSocket message type: ${message.type}`);
+            }
+        } catch (error) {
+            console.error('❌ WebSocket message error:', error);
+        }
+    });
+    
+    ws.on('close', () => {
+        if (sessionId) {
+            removeConnectionFromSession(sessionId, ws);
+        }
+        console.log('🔗 WebSocket connection closed');
+    });
+    
+    ws.on('error', (error) => {
+        console.error('❌ WebSocket error:', error);
+    });
+    
+    // Send welcome message
+    ws.send(JSON.stringify({
+        type: 'connected',
+        message: 'Connected to OneStopRadio DJ WebSocket server'
+    }));
+});
 
 // Audio system state for microphone and talkover
 let audioSystemState = {
@@ -571,6 +784,444 @@ app.get('/api/audio/levels', (req, res) => {
             channel_b_left: audioSystemState.channels.b.peak_left * 100,
             channel_b_right: audioSystemState.channels.b.peak_right * 100,
             timestamp: new Date().toISOString()
+        }
+    });
+});
+
+// Real-time DJ Session Management Endpoints
+// ==========================================
+
+// Create new DJ session
+app.post('/api/dj/sessions', (req, res) => {
+    const { session_name, dj_id = 'demo-dj', station_id = 'demo-station' } = req.body;
+    
+    if (!session_name) {
+        return res.status(400).json({
+            success: false,
+            error: 'session_name is required'
+        });
+    }
+    
+    const sessionId = `dj_session_${Date.now()}`;
+    const session = createDJSession(sessionId, dj_id, session_name);
+    
+    djSessions.set(sessionId, session);
+    
+    console.log(`🎧 Created DJ session: ${session_name} (${sessionId})`);
+    
+    res.json({
+        success: true,
+        action: 'session_created',
+        session: session
+    });
+});
+
+// Get DJ session by ID
+app.get('/api/dj/sessions/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    res.json({
+        success: true,
+        session: session
+    });
+});
+
+// Update DJ session settings
+app.patch('/api/dj/sessions/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    // Update session properties
+    Object.keys(req.body).forEach(key => {
+        if (key in session) {
+            session[key] = req.body[key];
+        }
+    });
+    
+    session.updated_at = new Date().toISOString();
+    
+    // Broadcast session update
+    broadcastToSession(sessionId, {
+        type: 'session_updated',
+        data: session
+    });
+    
+    console.log(`🎧 Updated DJ session ${sessionId}`);
+    
+    res.json({
+        success: true,
+        action: 'session_updated',
+        session: session
+    });
+});
+
+// End DJ session
+app.delete('/api/dj/sessions/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    session.ended_at = new Date().toISOString();
+    session.is_live = false;
+    
+    // Broadcast session ended
+    broadcastToSession(sessionId, {
+        type: 'session_ended',
+        data: { session_id: sessionId, ended_at: session.ended_at }
+    });
+    
+    // Clean up connections
+    djConnections.delete(sessionId);
+    djSessions.delete(sessionId);
+    
+    console.log(`🎧 Ended DJ session ${sessionId}`);
+    
+    res.json({
+        success: true,
+        action: 'session_ended',
+        session_id: sessionId
+    });
+});
+
+// Load track to deck
+app.post('/api/dj/sessions/:sessionId/tracks/:deck', (req, res) => {
+    const { sessionId, deck } = req.params;
+    const { track_id, track_title, track_artist, track_duration, bpm } = req.body;
+    
+    if (!['A', 'B'].includes(deck)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Deck must be "A" or "B"'
+        });
+    }
+    
+    const session = djSessions.get(sessionId);
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    const deckKey = deck === 'A' ? 'deck_a' : 'deck_b';
+    
+    // Stop current track if playing
+    if (session[deckKey].playing) {
+        session[deckKey].playing = false;
+    }
+    
+    // Load new track
+    session[deckKey].track = {
+        id: track_id || `track_${Date.now()}`,
+        title: track_title || 'Unknown Track',
+        artist: track_artist || 'Unknown Artist',
+        duration: track_duration || 0,
+        loaded_at: new Date().toISOString()
+    };
+    
+    session[deckKey].position = 0.0;
+    session[deckKey].bpm = bpm || null;
+    session.updated_at = new Date().toISOString();
+    
+    // Broadcast track loaded
+    broadcastToSession(sessionId, {
+        type: 'track_loaded',
+        deck: deck,
+        data: session[deckKey]
+    });
+    
+    console.log(`🎵 Loaded "${track_title}" to deck ${deck} in session ${sessionId}`);
+    
+    res.json({
+        success: true,
+        action: 'track_loaded',
+        deck: deck,
+        track_data: session[deckKey]
+    });
+});
+
+// Playback control (play, pause, cue, etc.)
+app.post('/api/dj/sessions/:sessionId/playback/:deck', (req, res) => {
+    const { sessionId, deck } = req.params;
+    const { action, position, speed } = req.body;
+    
+    if (!['A', 'B'].includes(deck)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Deck must be "A" or "B"'
+        });
+    }
+    
+    const validActions = ['play', 'pause', 'stop', 'cue', 'sync'];
+    if (!validActions.includes(action)) {
+        return res.status(400).json({
+            success: false,
+            error: `Action must be one of: ${validActions.join(', ')}`
+        });
+    }
+    
+    const session = djSessions.get(sessionId);
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    const deckKey = deck === 'A' ? 'deck_a' : 'deck_b';
+    
+    if (!session[deckKey].track) {
+        return res.status(400).json({
+            success: false,
+            error: 'No track loaded on this deck'
+        });
+    }
+    
+    // Apply playback action
+    switch (action) {
+        case 'play':
+            session[deckKey].playing = true;
+            if (speed) session[deckKey].speed = speed;
+            break;
+        case 'pause':
+            session[deckKey].playing = false;
+            break;
+        case 'stop':
+            session[deckKey].playing = false;
+            session[deckKey].position = 0.0;
+            break;
+        case 'cue':
+            session[deckKey].playing = false;
+            if (position !== undefined) session[deckKey].position = position;
+            break;
+        case 'sync':
+            session[deckKey].synced = !session[deckKey].synced;
+            break;
+    }
+    
+    session.updated_at = new Date().toISOString();
+    
+    // Broadcast playback control
+    broadcastToSession(sessionId, {
+        type: 'playback_control',
+        deck: deck,
+        action: action,
+        data: session[deckKey]
+    });
+    
+    console.log(`🎵 ${action.toUpperCase()} on deck ${deck} in session ${sessionId}`);
+    
+    res.json({
+        success: true,
+        action: `playback_${action}`,
+        deck: deck,
+        deck_state: session[deckKey]
+    });
+});
+
+// Mixer controls
+app.post('/api/dj/sessions/:sessionId/mixer', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    // Update mixer controls
+    Object.keys(req.body).forEach(key => {
+        if (key in session.mixer) {
+            session.mixer[key] = req.body[key];
+        }
+    });
+    
+    session.updated_at = new Date().toISOString();
+    
+    // Broadcast mixer update
+    broadcastToSession(sessionId, {
+        type: 'mixer_updated',
+        data: session.mixer
+    });
+    
+    console.log(`🎛️ Mixer updated in session ${sessionId}`);
+    
+    res.json({
+        success: true,
+        action: 'mixer_updated',
+        mixer_state: session.mixer
+    });
+});
+
+// Get current mixer state
+app.get('/api/dj/sessions/:sessionId/mixer', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    res.json({
+        success: true,
+        mixer_state: session.mixer
+    });
+});
+
+// Real-time statistics
+app.get('/api/dj/sessions/:sessionId/stats', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    // Calculate uptime
+    const startTime = new Date(session.started_at);
+    const uptime = Math.floor((Date.now() - startTime.getTime()) / 1000);
+    
+    const stats = {
+        session_id: sessionId,
+        current_time: new Date().toISOString(),
+        is_live: session.is_live,
+        uptime_seconds: uptime,
+        deck_a_track: session.deck_a.track,
+        deck_b_track: session.deck_b.track,
+        mixer_state: session.mixer,
+        audio_levels: session.audio_levels,
+        performance: {
+            current_listeners: session.stats.current_listeners,
+            peak_listeners: session.stats.peak_listeners,
+            total_tracks_played: session.stats.total_tracks_played
+        }
+    };
+    
+    res.json({
+        success: true,
+        stats: stats
+    });
+});
+
+// Update audio levels (real-time from audio engine)
+app.post('/api/dj/sessions/:sessionId/audio-levels', (req, res) => {
+    const { sessionId } = req.params;
+    const session = djSessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    session.audio_levels = {
+        ...req.body,
+        updated_at: new Date().toISOString()
+    };
+    
+    // Broadcast audio levels
+    broadcastToSession(sessionId, {
+        type: 'audio_levels',
+        data: session.audio_levels
+    });
+    
+    res.json({
+        success: true,
+        action: 'audio_levels_updated'
+    });
+});
+
+// List all active DJ sessions
+app.get('/api/dj/sessions', (req, res) => {
+    const sessions = Array.from(djSessions.values());
+    
+    res.json({
+        success: true,
+        sessions: sessions,
+        total_sessions: sessions.length,
+        active_sessions: sessions.filter(s => s.is_live).length
+    });
+});
+
+// BPM detection and beat matching
+app.post('/api/dj/sessions/:sessionId/bpm/:deck', (req, res) => {
+    const { sessionId, deck } = req.params;
+    const { bpm, sync_enabled, beat_position } = req.body;
+    
+    if (!['A', 'B'].includes(deck)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Deck must be "A" or "B"'
+        });
+    }
+    
+    const session = djSessions.get(sessionId);
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            error: 'DJ session not found'
+        });
+    }
+    
+    const deckKey = deck === 'A' ? 'deck_a' : 'deck_b';
+    
+    if (bpm) session[deckKey].bpm = bpm;
+    if (sync_enabled !== undefined) session[deckKey].synced = sync_enabled;
+    if (beat_position !== undefined) session[deckKey].beat_position = beat_position;
+    
+    session.updated_at = new Date().toISOString();
+    
+    // Broadcast BPM update
+    broadcastToSession(sessionId, {
+        type: 'bpm_updated',
+        deck: deck,
+        data: {
+            bpm: session[deckKey].bpm,
+            synced: session[deckKey].synced,
+            beat_position: session[deckKey].beat_position
+        }
+    });
+    
+    console.log(`🎵 BPM updated for deck ${deck}: ${bpm} BPM`);
+    
+    res.json({
+        success: true,
+        action: 'bpm_updated',
+        deck: deck,
+        bpm_data: {
+            bpm: session[deckKey].bpm,
+            synced: session[deckKey].synced,
+            beat_position: session[deckKey].beat_position
         }
     });
 });
@@ -1284,8 +1935,8 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Start server
-app.listen(port, () => {
+// Start server with WebSocket support
+server.listen(port, () => {
     console.log('🎵 OneStopRadio Mock Stream API Server');
     console.log('=====================================');
     console.log(`🚀 Server running on http://localhost:${port}`);
